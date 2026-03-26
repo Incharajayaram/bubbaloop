@@ -2,7 +2,7 @@
 name = "bubbaloop-gpu-demo"
 version = "0.1.0"
 edition = "2021"
-description = "CPU baseline demo: webcam to kornia-rs imgproc benchmark"
+description = "Webcam to kornia-rs imgproc benchmark"
 
 [dependencies]
 kornia = { version = "0.1.10-rc.3", features = ["v4l"] }
