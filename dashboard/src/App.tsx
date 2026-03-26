@@ -32,7 +32,7 @@ const ZENOH_ENDPOINT = getZenohEndpoint();
 // Default camera configuration - modify these to match your setup
 // Default cameras — topic starts empty; CameraView auto-detects the correct
 // scoped topic from discovered topics using the camera name as a hint.
-const DEFAULT_CAMERAS = [{ name: "entrance", topic: "" }];
+const DEFAULT_CAMERAS = [{ name: "gpu-processed", topic: "" }];
 
 function StatusIndicator({
   status,

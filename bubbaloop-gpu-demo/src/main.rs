@@ -183,6 +183,17 @@ impl FrameSource {
         }
     }
 
+    fn ensure_rgb_buffer(camera: &mut CameraSource, size: ImageSize) -> DemoResult<()> {
+        if camera.rgb_buffer.size() != size {
+            camera.rgb_buffer = Image::<u8, 3, _>::from_size_val(size, 0, CpuAllocator)?;
+            eprintln!(
+                "Reallocated webcam RGB buffer to {}x{}",
+                size.width, size.height
+            );
+        }
+        Ok(())
+    }
+
     fn next_rgb8(&mut self) -> DemoResult<Option<&Image<u8, 3, CpuAllocator>>> {
         match &mut self.mode {
             FrameMode::StaticImage(image) => Ok(Some(image)),
@@ -195,6 +206,11 @@ impl FrameSource {
 
                 match frame.pixel_format {
                     PixelFormat::MJPG => {
+                        let (jpeg_size, channels) = jpeg::decode_image_jpeg_info(frame.buffer.as_slice())?;
+                        if channels != 3 {
+                            return Err(format!("unsupported MJPG channel count: {channels}").into());
+                        }
+                        Self::ensure_rgb_buffer(camera, jpeg_size)?;
                         jpeg::decode_image_jpeg_rgb8(frame.buffer.as_slice(), &mut camera.rgb_buffer)?;
                     }
                     PixelFormat::YUYV => {

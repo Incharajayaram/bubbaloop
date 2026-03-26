@@ -1,0 +1,11 @@
+# kornia-gpu-node configuration
+
+# V4L2 camera device index (0 = /dev/video0)
+device_id: 0
+
+# Target resize dimensions for GPU preprocessing
+resize_width: 640
+resize_height: 640
+
+# Publishing rate in Hz
+rate_hz: 15.0

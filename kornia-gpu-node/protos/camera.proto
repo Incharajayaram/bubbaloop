@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package bubbaloop.camera.v1;
+
+import "header.proto";
+
+message CompressedImage {
+  bubbaloop.header.v1.Header header = 1;
+  string format = 2;
+  bytes data = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+}

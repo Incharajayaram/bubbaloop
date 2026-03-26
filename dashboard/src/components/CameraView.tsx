@@ -2,7 +2,6 @@ import { useRef, useEffect, useCallback, useState } from 'react';
 import { Sample } from '@eclipse-zenoh/zenoh-ts';
 import { getSamplePayload } from '../lib/zenoh';
 import { useZenohSubscription } from '../hooks/useZenohSubscription';
-import { useSchemaReady } from '../hooks/useSchemaReady';
 import { useFleetContext } from '../contexts/FleetContext';
 import { useSchemaRegistry } from '../contexts/SchemaRegistryContext';
 import { MachineBadge } from './MachineBadge';
@@ -28,6 +27,159 @@ function toLongBigInt(value: Long | number | undefined | null): bigint {
   if (typeof value === 'number') return BigInt(value);
   if (Long.isLong(value)) return BigInt(value.toString());
   return 0n;
+}
+
+interface DecodedHeader {
+  acqTime: bigint;
+  pubTime: bigint;
+  sequence: number;
+  frameId: string;
+}
+
+interface DecodedCompressedImage {
+  header?: DecodedHeader;
+  format: string;
+  data: Uint8Array;
+}
+
+function readVarint(buf: Uint8Array, start: number): { value: bigint; next: number } | null {
+  let value = 0n;
+  let shift = 0n;
+  let i = start;
+
+  while (i < buf.length) {
+    const byte = buf[i];
+    value |= BigInt(byte & 0x7f) << shift;
+    i += 1;
+    if ((byte & 0x80) === 0) return { value, next: i };
+    shift += 7n;
+    if (shift > 63n) return null;
+  }
+
+  return null;
+}
+
+function skipField(buf: Uint8Array, start: number, wireType: number): number | null {
+  switch (wireType) {
+    case 0: {
+      const v = readVarint(buf, start);
+      return v ? v.next : null;
+    }
+    case 1:
+      return start + 8 <= buf.length ? start + 8 : null;
+    case 2: {
+      const len = readVarint(buf, start);
+      if (!len) return null;
+      const n = Number(len.value);
+      const next = len.next + n;
+      return next <= buf.length ? next : null;
+    }
+    case 5:
+      return start + 4 <= buf.length ? start + 4 : null;
+    default:
+      return null;
+  }
+}
+
+function bigintToSafeNumber(value: bigint): number {
+  const max = BigInt(Number.MAX_SAFE_INTEGER);
+  if (value > max) return Number.MAX_SAFE_INTEGER;
+  return Number(value);
+}
+
+function decodeHeaderFallback(payload: Uint8Array): DecodedHeader | undefined {
+  let i = 0;
+  let acqTime = 0n;
+  let pubTime = 0n;
+  let sequence = 0;
+  let frameId = '';
+
+  while (i < payload.length) {
+    const tag = readVarint(payload, i);
+    if (!tag) return undefined;
+    i = tag.next;
+    const field = Number(tag.value >> 3n);
+    const wireType = Number(tag.value & 0x7n);
+
+    if (field === 1 && wireType === 0) {
+      const v = readVarint(payload, i);
+      if (!v) return undefined;
+      acqTime = v.value;
+      i = v.next;
+      continue;
+    }
+
+    if (field === 2 && wireType === 0) {
+      const v = readVarint(payload, i);
+      if (!v) return undefined;
+      pubTime = v.value;
+      i = v.next;
+      continue;
+    }
+
+    if (field === 3 && wireType === 0) {
+      const v = readVarint(payload, i);
+      if (!v) return undefined;
+      sequence = bigintToSafeNumber(v.value);
+      i = v.next;
+      continue;
+    }
+
+    if (field === 4 && wireType === 2) {
+      const len = readVarint(payload, i);
+      if (!len) return undefined;
+      const n = Number(len.value);
+      const end = len.next + n;
+      if (end > payload.length) return undefined;
+      frameId = new TextDecoder().decode(payload.subarray(len.next, end));
+      i = end;
+      continue;
+    }
+
+    const next = skipField(payload, i, wireType);
+    if (next === null) return undefined;
+    i = next;
+  }
+
+  return { acqTime, pubTime, sequence, frameId };
+}
+
+function decodeCompressedImageFallback(payload: Uint8Array): DecodedCompressedImage | null {
+  let i = 0;
+  let header: DecodedHeader | undefined;
+  let format = '';
+  let data = new Uint8Array(0);
+
+  while (i < payload.length) {
+    const tag = readVarint(payload, i);
+    if (!tag) return null;
+    i = tag.next;
+    const field = Number(tag.value >> 3n);
+    const wireType = Number(tag.value & 0x7n);
+
+    if ((field === 1 || field === 2 || field === 3) && wireType === 2) {
+      const len = readVarint(payload, i);
+      if (!len) return null;
+      const n = Number(len.value);
+      const end = len.next + n;
+      if (end > payload.length) return null;
+      const bytes = payload.subarray(len.next, end);
+
+      if (field === 1) header = decodeHeaderFallback(bytes);
+      if (field === 2) format = new TextDecoder().decode(bytes);
+      if (field === 3) data = bytes;
+
+      i = end;
+      continue;
+    }
+
+    const next = skipField(payload, i, wireType);
+    if (next === null) return null;
+    i = next;
+  }
+
+  if (!format && data.length === 0) return null;
+  return { header, format, data };
 }
 
 interface DragHandleProps {
@@ -124,7 +276,6 @@ export function CameraView({
 
   // Get SchemaRegistry for dynamic decoding
   const { registry, discoverForTopic } = useSchemaRegistry();
-  const schemaReady = useSchemaReady();
 
   // Handle incoming samples from Zenoh
   const handleSample = useCallback((sample: Sample) => {
@@ -136,30 +287,79 @@ export function CameraView({
       const sampleTopic = sample.keyexpr().toString();
 
       // Use SchemaRegistry to look up CompressedImage type and decode directly.
-      // This preserves raw bytes (no base64 roundtrip) for H264 decoding.
+      // Fallback decoder handles frames even if schema discovery is delayed.
       const msgType = registry.lookupType('bubbaloop.camera.v1.CompressedImage');
-      if (!msgType) {
-        // Schema not yet available — trigger discovery for node-specific schemas
-        discoverForTopic(sampleTopic);
-        return;
+      let header: CameraMeta['header'] | undefined;
+      let format = '';
+      let data = new Uint8Array(0);
+
+      if (msgType) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const msg = msgType.decode(payload) as any;
+          format = msg.format ?? '';
+          data = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data ?? []);
+          header = msg.header ? {
+            acqTime: toLongBigInt(msg.header.acqTime),
+            pubTime: toLongBigInt(msg.header.pubTime),
+            sequence: msg.header.sequence ?? 0,
+            frameId: msg.header.frameId ?? '',
+          } : undefined;
+        } catch (e) {
+          console.warn('[CameraView] Schema decode failed, trying fallback decoder:', e);
+        }
       }
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const msg = msgType.decode(payload) as any;
-      const format: string = msg.format ?? '';
-      const data: Uint8Array = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data ?? []);
-      const header = msg.header ? {
-        acqTime: toLongBigInt(msg.header.acqTime),
-        pubTime: toLongBigInt(msg.header.pubTime),
-        sequence: msg.header.sequence ?? 0,
-        frameId: msg.header.frameId ?? '',
-      } : undefined;
+      if (!msgType) {
+        discoverForTopic(sampleTopic);
+      }
+
+      if (format === '' && data.length === 0) {
+        const fallback = decodeCompressedImageFallback(payload);
+        if (!fallback) return;
+        format = fallback.format;
+        data = fallback.data;
+        header = fallback.header;
+      }
+
+      const formatLower = format.toLowerCase();
 
       // Store latest metadata in ref (no re-render)
       lastMetaRef.current = { header, format, dataSize: data.length };
 
-      // Skip non-h264 formats (but allow empty format in case field is missing)
-      if (format && format !== 'h264') {
+      // JPEG fallback path (for nodes publishing CompressedImage JPEG payloads)
+      if (formatLower === 'jpeg' || formatLower === 'jpg' || formatLower === 'mjpeg') {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        void (async () => {
+          try {
+            const blob = new Blob([data], { type: 'image/jpeg' });
+            const bitmap = await createImageBitmap(blob);
+
+            if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+              canvas.width = bitmap.width;
+              canvas.height = bitmap.height;
+              setDimensions({ width: bitmap.width, height: bitmap.height });
+            }
+
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(bitmap, 0, 0);
+              frameCountRef.current++;
+            }
+
+            bitmap.close();
+          } catch (e) {
+            console.error('[CameraView] JPEG render error:', e);
+          }
+        })();
+
+        return;
+      }
+
+      // Skip unsupported formats (allow empty format for legacy H264 publishers)
+      if (formatLower && formatLower !== 'h264') {
         console.warn(`[CameraView] Unexpected format: ${format}`);
         return;
       }
@@ -205,7 +405,7 @@ export function CameraView({
 
   // Subscribe to camera topic — gate callback on schema readiness so we don't
   // drop frames (especially keyframes) before schemas are available to decode them
-  useZenohSubscription(topic, schemaReady ? handleSample : undefined);
+  useZenohSubscription(topic, handleSample);
 
   // Periodically update metadata state when info panel is visible
   useEffect(() => {
