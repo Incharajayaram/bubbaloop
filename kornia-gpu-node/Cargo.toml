@@ -42,4 +42,8 @@ serde_yaml = "0.9"
 [build-dependencies]
 prost-build = "0.14"
 
+[features]
+default = []
+vlm = ["kornia-vlm/flash-attn"]
+
 [workspace]

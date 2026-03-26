@@ -727,6 +727,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-flash-attn"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb38a5bfae09c4ae73fd00039e5eaf97a7d6d9400cc35ee8e603fc4a5f9cb0a3"
+dependencies = [
+ "anyhow",
+ "bindgen_cuda",
+ "candle-core",
+ "half",
+]
+
+[[package]]
 name = "candle-kernels"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -758,6 +770,7 @@ checksum = "186cb80045dbe47e0b387ea6d3e906f02fb3056297080d9922984c90e90a72b0"
 dependencies = [
  "byteorder",
  "candle-core",
+ "candle-flash-attn",
  "candle-nn",
  "fancy-regex",
  "num-traits",

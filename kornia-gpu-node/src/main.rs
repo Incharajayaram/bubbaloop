@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bubbaloop_node_sdk::anyhow::{anyhow, Result};
 use bubbaloop_node_sdk::async_trait::async_trait;
@@ -15,6 +15,7 @@ use kornia::image::{Image, ImageSize};
 use kornia::imgproc;
 use kornia::io::jpeg;
 use kornia::io::v4l::{PixelFormat, V4LCameraConfig, V4lVideoCapture};
+#[cfg(feature = "vlm")]
 use kornia_vlm::smolvlm2::{InputMedia, Line, Message as VlmMessage, Role, SmolVlm2, SmolVlm2Config};
 use prost::Message;
 use tokio::sync::mpsc;
@@ -340,19 +341,39 @@ pub struct Config {
     pub resize_width: u32,
     pub resize_height: u32,
     pub rate_hz: f64,
+    #[serde(default)]
+    pub enable_vlm: bool,
+    #[serde(default = "default_vlm_every_n_frames")]
+    pub vlm_every_n_frames: u32,
+    #[serde(default = "default_vlm_prompt")]
+    pub vlm_prompt: String,
+}
+
+fn default_vlm_every_n_frames() -> u32 {
+    30
+}
+
+fn default_vlm_prompt() -> String {
+    "Briefly describe what you see in one sentence.".to_string()
 }
 
 pub struct KorniaGpuNode {
     publisher: zenoh::pubsub::Publisher<'static>,
+    #[cfg(feature = "vlm")]
     vlm_publisher: zenoh::pubsub::Publisher<'static>,
     frame_rx: mpsc::Receiver<FramePacket>,
     gpu: Arc<GpuPipeline>,
-    vlm: SmolVlm2<32, CpuAllocator>,
+    #[cfg(feature = "vlm")]
+    vlm: Option<SmolVlm2<32, CpuAllocator>>,
     resize_width: u32,
     resize_height: u32,
     scope: String,
     machine_id: String,
     publish_period: Option<Duration>,
+    enable_vlm: bool,
+    vlm_every_n_frames: u32,
+    #[cfg(feature = "vlm")]
+    vlm_prompt: String,
 }
 
 #[async_trait]
@@ -375,21 +396,37 @@ impl Node for KorniaGpuNode {
             .await
             .map_err(|e| anyhow!("declare_publisher failed: {e}"))?;
 
+        #[cfg(feature = "vlm")]
         let vlm_topic = ctx.topic("camera/gpu-processed/vlm-label");
+        #[cfg(feature = "vlm")]
         let vlm_publisher = ctx
             .session
             .declare_publisher(vlm_topic.clone())
             .await
             .map_err(|e| anyhow!("declare_publisher vlm failed: {e}"))?;
 
-        log::info!("loading SmolVLM2 model (this can take time on first run)...");
-        let vlm_config = SmolVlm2Config {
-            do_sample: false,
-            debug: false,
-            ..Default::default()
+        #[cfg(feature = "vlm")]
+        let vlm = if config.enable_vlm {
+            log::info!("loading SmolVLM2 model (this can take time on first run)...");
+            let vlm_config = SmolVlm2Config {
+                do_sample: false,
+                debug: false,
+                ..Default::default()
+            };
+            Some(
+                SmolVlm2::<32, CpuAllocator>::new(vlm_config)
+                    .map_err(|e| anyhow!("SmolVLM2 init failed: {e}"))?,
+            )
+        } else {
+            None
         };
-        let vlm = SmolVlm2::<32, CpuAllocator>::new(vlm_config)
-            .map_err(|e| anyhow!("SmolVLM2 init failed: {e}"))?;
+
+        #[cfg(not(feature = "vlm"))]
+        if config.enable_vlm {
+            log::warn!(
+                "config requested VLM captions, but the node was built without the `vlm` feature"
+            );
+        }
 
         let (frame_tx, frame_rx) = mpsc::channel::<FramePacket>(4);
         spawn_capture_thread(config.device_id, frame_tx);
@@ -406,19 +443,31 @@ impl Node for KorniaGpuNode {
         };
 
         log::info!("publishing to topic: {}", topic);
+        #[cfg(feature = "vlm")]
         log::info!("publishing VLM labels to topic: {}", vlm_topic);
+        log::info!(
+            "VLM enabled: {} (every {} frames)",
+            config.enable_vlm,
+            config.vlm_every_n_frames
+        );
 
         Ok(Self {
             publisher,
+            #[cfg(feature = "vlm")]
             vlm_publisher,
             frame_rx,
             gpu,
+            #[cfg(feature = "vlm")]
             vlm,
             resize_width: config.resize_width,
             resize_height: config.resize_height,
             scope: ctx.scope.clone(),
             machine_id: ctx.machine_id.clone(),
             publish_period,
+            enable_vlm: config.enable_vlm,
+            vlm_every_n_frames: config.vlm_every_n_frames.max(1),
+            #[cfg(feature = "vlm")]
+            vlm_prompt: config.vlm_prompt.clone(),
         })
     }
 
@@ -439,7 +488,18 @@ impl Node for KorniaGpuNode {
                         }
                     };
 
-                    log::info!("received frame seq={} size={}x{}", sequence, packet.frame.width(), packet.frame.height());
+                    let frame_start = Instant::now();
+                    let run_vlm = self.enable_vlm && sequence % self.vlm_every_n_frames == 0;
+
+                    log::info!(
+                        "frame seq={} size={}x{} vlm={}",
+                        sequence,
+                        packet.frame.width(),
+                        packet.frame.height(),
+                        run_vlm
+                    );
+
+                    let gpu_start = Instant::now();
                     let processed = match self.gpu.process(&packet.frame) {
                         Ok(v) => v,
                         Err(err) => {
@@ -447,8 +507,9 @@ impl Node for KorniaGpuNode {
                             continue;
                         }
                     };
+                    let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
 
-                    log::info!("gpu done seq={} gray_len={}", sequence, processed.len());
+                    let jpeg_start = Instant::now();
                     let jpeg = match encode_jpeg_gray(&processed, self.resize_width, self.resize_height) {
                         Ok(v) => v,
                         Err(err) => {
@@ -456,35 +517,45 @@ impl Node for KorniaGpuNode {
                             continue;
                         }
                     };
+                    let jpeg_ms = jpeg_start.elapsed().as_secs_f64() * 1000.0;
 
-                    if sequence % 30 == 0 {
-                        if let Err(e) = self.vlm.clear_context() {
-                            log::warn!("vlm clear_context failed: {e}");
-                        }
-
-                        let response = self.vlm.inference(
-                            vec![VlmMessage {
-                                role: Role::User,
-                                content: vec![
-                                    Line::Image,
-                                    Line::Text {
-                                        text: "Briefly describe what you see in one sentence.".to_string(),
-                                    },
-                                ],
-                            }],
-                            Some(InputMedia::Images(vec![packet.frame.clone()])),
-                            80,
-                            CpuAllocator,
-                        );
-
-                        match response {
-                            Ok(label) => {
-                                log::info!("vlm seq={} label={}", sequence, label);
-                                if let Err(e) = self.vlm_publisher.put(label.into_bytes()).await {
-                                    log::warn!("vlm label publish failed seq={}: {}", sequence, e);
-                                }
+                    #[cfg(feature = "vlm")]
+                    let mut vlm_ms: Option<f64> = None;
+                    #[cfg(not(feature = "vlm"))]
+                    let vlm_ms: Option<f64> = None;
+                    #[cfg(feature = "vlm")]
+                    if run_vlm {
+                        if let Some(vlm) = self.vlm.as_mut() {
+                            if let Err(e) = vlm.clear_context() {
+                                log::warn!("vlm clear_context failed: {e}");
                             }
-                            Err(e) => log::warn!("vlm inference failed seq={}: {}", sequence, e),
+
+                            let vlm_start = Instant::now();
+                            let response = vlm.inference(
+                                vec![VlmMessage {
+                                    role: Role::User,
+                                    content: vec![
+                                        Line::Image,
+                                        Line::Text {
+                                            text: self.vlm_prompt.clone(),
+                                        },
+                                    ],
+                                }],
+                                Some(InputMedia::Images(vec![packet.frame.clone()])),
+                                80,
+                                CpuAllocator,
+                            );
+                            vlm_ms = Some(vlm_start.elapsed().as_secs_f64() * 1000.0);
+
+                            match response {
+                                Ok(label) => {
+                                    log::info!("vlm seq={} label={}", sequence, label);
+                                    if let Err(e) = self.vlm_publisher.put(label.into_bytes()).await {
+                                        log::warn!("vlm label publish failed seq={}: {}", sequence, e);
+                                    }
+                                }
+                                Err(e) => log::warn!("vlm inference failed seq={}: {}", sequence, e),
+                            }
                         }
                     }
 
@@ -505,10 +576,30 @@ impl Node for KorniaGpuNode {
                     };
 
                     let payload = msg.encode_to_vec();
-                    log::info!("publishing seq={} jpeg_bytes={}", sequence, msg.data.len());
                     if let Err(err) = self.publisher.put(payload).await {
                         log::warn!("publish failed: {err}");
                         continue;
+                    }
+
+                    let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+                    match vlm_ms {
+                        Some(vlm_ms) => log::info!(
+                            "seq={} gpu={:.2}ms jpeg={:.2}ms vlm={:.2}ms total={:.2}ms bytes={}",
+                            sequence,
+                            gpu_ms,
+                            jpeg_ms,
+                            vlm_ms,
+                            total_ms,
+                            msg.data.len()
+                        ),
+                        None => log::info!(
+                            "seq={} gpu={:.2}ms jpeg={:.2}ms total={:.2}ms bytes={}",
+                            sequence,
+                            gpu_ms,
+                            jpeg_ms,
+                            total_ms,
+                            msg.data.len()
+                        ),
                     }
 
                     sequence = sequence.wrapping_add(1);
