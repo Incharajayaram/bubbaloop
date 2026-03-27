@@ -1,21 +1,14 @@
 # kornia-gpu-node configuration
 
-# V4L2 camera device index (0 = /dev/video0)
 device_id: 0
 
-# Target resize dimensions for GPU preprocessing
 resize_width: 640
 resize_height: 640
 
-# Publishing rate in Hz
 rate_hz: 15.0
 
-# Enable SmolVLM2 caption generation. Requires building the node with:
-# cargo run --release --features vlm -- -c config.yaml
+use_gpu: true
+
 enable_vlm: false
-
-# Run captioning every N frames when VLM is enabled.
 vlm_every_n_frames: 30
-
-# Prompt used for caption generation.
 vlm_prompt: "Briefly describe what you see in one sentence."

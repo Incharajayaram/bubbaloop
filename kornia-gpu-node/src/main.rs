@@ -11,7 +11,7 @@ use bubbaloop_schemas::Header;
 use cubecl::prelude::*;
 use cubecl_wgpu::{WgpuDevice, WgpuRuntime};
 use kornia::image::allocator::CpuAllocator;
-use kornia::image::{Image, ImageSize};
+use kornia::image::{Image, ImageSize, InterpolationMode};
 use kornia::imgproc;
 use kornia::io::jpeg;
 use kornia::io::v4l::{PixelFormat, V4LCameraConfig, V4lVideoCapture};
@@ -335,18 +335,46 @@ fn encode_jpeg_gray(data: &[f32], width: u32, height: u32) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn cpu_preprocess(frame: &RgbImage, dst_w: usize, dst_h: usize) -> Result<Vec<f32>> {
+    let mut gray = Image::<u8, 1, _>::from_size_val(frame.size(), 0, CpuAllocator)?;
+    imgproc::color::gray_from_rgb_u8(frame, &mut gray).map_err(|e| anyhow!(e.to_string()))?;
+
+    let mut resized = Image::<u8, 1, _>::from_size_val(
+        ImageSize {
+            width: dst_w,
+            height: dst_h,
+        },
+        0,
+        CpuAllocator,
+    )?;
+    imgproc::resize::resize_fast_mono(&gray, &mut resized, InterpolationMode::Bilinear)
+        .map_err(|e| anyhow!(e.to_string()))?;
+
+    Ok(resized
+        .as_slice()
+        .iter()
+        .map(|&v| v as f32 / 255.0)
+        .collect())
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     pub device_id: u32,
     pub resize_width: u32,
     pub resize_height: u32,
     pub rate_hz: f64,
+    #[serde(default = "default_use_gpu")]
+    pub use_gpu: bool,
     #[serde(default)]
     pub enable_vlm: bool,
     #[serde(default = "default_vlm_every_n_frames")]
     pub vlm_every_n_frames: u32,
     #[serde(default = "default_vlm_prompt")]
     pub vlm_prompt: String,
+}
+
+fn default_use_gpu() -> bool {
+    true
 }
 
 fn default_vlm_every_n_frames() -> u32 {
@@ -370,6 +398,7 @@ pub struct KorniaGpuNode {
     scope: String,
     machine_id: String,
     publish_period: Option<Duration>,
+    use_gpu: bool,
     enable_vlm: bool,
     vlm_every_n_frames: u32,
     #[cfg(feature = "vlm")]
@@ -446,7 +475,8 @@ impl Node for KorniaGpuNode {
         #[cfg(feature = "vlm")]
         log::info!("publishing VLM labels to topic: {}", vlm_topic);
         log::info!(
-            "VLM enabled: {} (every {} frames)",
+            "Pipeline mode: {} | VLM enabled: {} (every {} frames)",
+            if config.use_gpu { "gpu" } else { "cpu" },
             config.enable_vlm,
             config.vlm_every_n_frames
         );
@@ -464,6 +494,7 @@ impl Node for KorniaGpuNode {
             scope: ctx.scope.clone(),
             machine_id: ctx.machine_id.clone(),
             publish_period,
+            use_gpu: config.use_gpu,
             enable_vlm: config.enable_vlm,
             vlm_every_n_frames: config.vlm_every_n_frames.max(1),
             #[cfg(feature = "vlm")]
@@ -499,15 +530,29 @@ impl Node for KorniaGpuNode {
                         run_vlm
                     );
 
-                    let gpu_start = Instant::now();
-                    let processed = match self.gpu.process(&packet.frame) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            log::warn!("gpu process failed: {err}");
-                            continue;
+                    let preprocess_start = Instant::now();
+                    let processed = if self.use_gpu {
+                        match self.gpu.process(&packet.frame) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                log::warn!("gpu process failed: {err}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        match cpu_preprocess(
+                            &packet.frame,
+                            self.resize_width as usize,
+                            self.resize_height as usize,
+                        ) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                log::warn!("cpu process failed: {err}");
+                                continue;
+                            }
                         }
                     };
-                    let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
+                    let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
 
                     let jpeg_start = Instant::now();
                     let jpeg = match encode_jpeg_gray(&processed, self.resize_width, self.resize_height) {
@@ -584,18 +629,20 @@ impl Node for KorniaGpuNode {
                     let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
                     match vlm_ms {
                         Some(vlm_ms) => log::info!(
-                            "seq={} gpu={:.2}ms jpeg={:.2}ms vlm={:.2}ms total={:.2}ms bytes={}",
+                            "seq={} mode={} preprocess={:.2}ms jpeg={:.2}ms vlm={:.2}ms total={:.2}ms bytes={}",
                             sequence,
-                            gpu_ms,
+                            if self.use_gpu { "gpu" } else { "cpu" },
+                            preprocess_ms,
                             jpeg_ms,
                             vlm_ms,
                             total_ms,
                             msg.data.len()
                         ),
                         None => log::info!(
-                            "seq={} gpu={:.2}ms jpeg={:.2}ms total={:.2}ms bytes={}",
+                            "seq={} mode={} preprocess={:.2}ms jpeg={:.2}ms total={:.2}ms bytes={}",
                             sequence,
-                            gpu_ms,
+                            if self.use_gpu { "gpu" } else { "cpu" },
+                            preprocess_ms,
                             jpeg_ms,
                             total_ms,
                             msg.data.len()
