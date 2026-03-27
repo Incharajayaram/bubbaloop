@@ -14,8 +14,8 @@ bubbaloop-node-sdk = { path = "../crates/bubbaloop-node-sdk" }
 bubbaloop-schemas = { path = "../crates/bubbaloop-schemas" }
 
 # Kornia + V4L capture
-kornia = { path = "/home/incharanew/kornia-rs/crates/kornia", features = ["v4l"] }
-kornia-vlm = { path = "/home/incharanew/kornia-rs/crates/kornia-vlm", features = ["cuda"] }
+kornia = { path = "../../kornia-rs/crates/kornia", features = ["v4l"] }
+kornia-vlm = { path = "../../kornia-rs/crates/kornia-vlm", features = ["cuda"] }
 candle-core = { version = "=0.9.1", features = ["cuda"] }
 candle-nn = { version = "=0.9.1", features = ["cuda"] }
 candle-transformers = { version = "=0.9.1", features = ["cuda"] }
